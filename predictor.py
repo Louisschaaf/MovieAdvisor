@@ -1,151 +1,80 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
-from sklearn.metrics.pairwise import linear_kernel, cosine_similarity
+from sklearn.metrics.pairwise import cosine_similarity, linear_kernel
 from flask import Flask, request, jsonify
-from ast import literal_eval
+import requests
 
 app = Flask(__name__)
 
-# Initialize global variables for the model components
-df2 = None
-cosine_sim2 = None
-indices = None
+# TMDb API Key (replace with your API key)
+TMDB_API_KEY = 'your_tmdb_api_key'  # Replace with your TMDb API key
 
-def read_data(file_path):
-    df = pd.read_csv(file_path)
-    df.dropna(inplace=True)
+def read_data():
+    data = pd.read_csv('./data/imdb_top_1000.csv')
+    df = pd.DataFrame(data)
     return df
 
-def weighted_rating(x, m, C):
-    v = x['vote_count']
-    R = x['vote_average']
-    return (v / (v + m) * R) + (m / (m + v) * C)
+# Read and preprocess the data
+df = read_data()
+df = df.drop(columns=['Certificate', 'Gross', 'Meta_score'])
 
-def get_director(x):
-    for i in x:
-        if i['job'] == 'Director':
-            return i['name']
-    return np.nan
+# Set up TF-IDF and Count Vectorizer for cosine similarity
+tfidf = TfidfVectorizer(stop_words='english')
+tfidf_matrix = tfidf.fit_transform(df['Overview'])
+sim_vec = linear_kernel(tfidf_matrix, tfidf_matrix)
+indexes = pd.Series(df.index, index=df['Series_Title'])
 
-def get_list(x):
-    if isinstance(x, list):
-        return [i['name'] for i in x]
-    return []
+# Meta-data soup for improved similarity matching
+df['meta_soup'] = df['Genre'] + ' ' + df['Director'] + ' ' + df['Star1'] + ' ' + df['Star2'] + ' ' + df['Star3'] + ' ' + df['Star4']
+count = CountVectorizer(stop_words='english')
+count_matrix = count.fit_transform(df['meta_soup'])
+sim_vec = cosine_similarity(count_matrix, count_matrix)
+indexes = pd.Series(df.index, index=df['Series_Title'])
 
-def clean_data(x):
-    if isinstance(x, list):
-        return [str.lower(i.replace(" ", "")) for i in x]
-    elif isinstance(x, str):
-        return str.lower(x.replace(" ", ""))
-    else:
-        return ''
+# Function to fetch movie poster URL from csv
+def fetch_movie_poster(title):
+    movies = read_data()
+    # column poster_link for movie with title
+    poster_link = movies.loc[movies['Series_Title'] == title, 'Poster_Link'].values[0]
+    return poster_link
 
-def create_soup(x):
-    return ' '.join(x['keywords']) + ' ' + ' '.join(x['cast']) + ' ' + x['director'] + ' ' + ' '.join(x['genres'])
+# Function to get recommendations with poster URLs
+def recommend_movies(title, sim_vec):
+    title = title.strip()
+    if title not in indexes:
+        return {"error": "Movie title not found."}
 
-# Function that takes in movie title as input and outputs most similar movies
-def get_recommendations(title):
-    global df2, cosine_sim2, indices
+    id_ = indexes[title]
+    sim_movies = list(enumerate(sim_vec[id_]))
+    sim_movies = sorted(sim_movies, key=lambda x: x[1], reverse=True)[1:11]  # Top 10 recommendations
 
-    # Normalize the input title for matching
-    title = title.strip().lower()
+    recommendations = []
+    for i in sim_movies:
+        movie_idx = i[0]
+        movie_details = df.iloc[movie_idx][['Series_Title', 'Released_Year', 'IMDB_Rating', 'Genre', 'Director', 'Star1', 'Star2', 'Star3', 'Star4']]
+        
+        # Fetch poster URL for each movie
+        poster_url = fetch_movie_poster(movie_details['Series_Title'])
+        
+        # Append movie details and poster URL to the recommendations list
+        recommendations.append({
+            "title": movie_details['Series_Title'],
+            "year": movie_details['Released_Year'],
+            "rating": movie_details['IMDB_Rating'],
+            "genre": movie_details['Genre'],
+            "director": movie_details['Director'],
+            "stars": [movie_details['Star1'], movie_details['Star2'], movie_details['Star3'], movie_details['Star4']],
+            "poster_url": poster_url
+        })
 
-    if title not in indices:
-        return []
-    
-    # Get the index of the movie that matches the title
-    idx = indices[title]
+    return recommendations
 
-    # Get the pairwise similarity scores of all movies with that movie
-    sim_scores = list(enumerate(cosine_sim2[idx]))
-
-    # Sort the movies based on the similarity scores
-    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
-
-    # Get the scores of the 10 most similar movies
-    sim_scores = sim_scores[1:11]
-
-    # Get the movie indices
-    movie_indices = [i[0] for i in sim_scores]
-
-    # Return the top 10 most similar movies
-    return df2['title'].iloc[movie_indices].tolist()
-
-def setup_model():
-    global df2, cosine_sim2, indices
-
-    # Load data
-    df1 = read_data('./data/tmdb_5000_credits.csv')
-    df2 = read_data('./data/tmdb_5000_movies.csv')
-
-    df1.columns = ['id', 'title', 'cast', 'crew']
-    df2 = df2.merge(df1, on='id')
-
-    # Rename the title column appropriately
-    if 'title_x' in df2.columns and 'title_y' in df2.columns:
-        df2['title'] = df2['title_x']  # Assuming title_x has the correct title data
-        df2 = df2.drop(['title_x', 'title_y'], axis=1)  # Drop the redundant title columns
-    elif 'title_x' in df2.columns:
-        df2.rename(columns={'title_x': 'title'}, inplace=True)
-    elif 'title_y' in df2.columns:
-        df2.rename(columns={'title_y': 'title'}, inplace=True)
-
-    # Calculate mean and quantile for weighted rating
-    C = df2['vote_average'].mean()
-    m = df2['vote_count'].quantile(0.9)
-
-    # Filter movies for the recommendation model
-    df2 = df2.copy().loc[df2['vote_count'] >= m]
-    df2['score'] = df2.apply(weighted_rating, axis=1, m=m, C=C)
-    df2 = df2.sort_values('score', ascending=False)
-
-    # Process data for recommendation
-    df2['overview'] = df2['overview'].fillna('')
-    tfidf = TfidfVectorizer(stop_words='english')
-    tfidf_matrix = tfidf.fit_transform(df2['overview'])
-    cosine_sim = linear_kernel(tfidf_matrix, tfidf_matrix)
-
-    features = ['cast', 'crew', 'keywords', 'genres']
-    for feature in features:
-        df2[feature] = df2[feature].apply(literal_eval)
-
-    df2['director'] = df2['crew'].apply(get_director)
-
-    features = ['cast', 'keywords', 'genres']
-    for feature in features:
-        df2[feature] = df2[feature].apply(get_list)
-
-    features = ['cast', 'keywords', 'director', 'genres']
-    for feature in features:
-        df2[feature] = df2[feature].apply(clean_data)
-
-    df2['soup'] = df2.apply(create_soup, axis=1)
-
-    count = CountVectorizer(stop_words='english')
-    count_matrix = count.fit_transform(df2['soup'])
-    cosine_sim2 = cosine_similarity(count_matrix, count_matrix)
-
-    # Reset the index and create reverse mapping with normalized titles
-    df2 = df2.reset_index()
-    indices = pd.Series(df2.index, index=df2['title'].str.strip().str.lower()).drop_duplicates()
-
-
-# Endpoint to get recommendations for a movie title
 @app.route('/recommend', methods=['GET'])
 def recommend():
     title = request.args.get('title')
-    if not title:
-        return jsonify({"error": "Please provide a movie title"}), 400
-    
-    recommendations = get_recommendations(title)
-    if not recommendations:
-        return jsonify({"error": f"No recommendations found for title: {title}"}), 404
-
+    recommendations = recommend_movies(title, sim_vec)
     return jsonify(recommendations)
 
-# Setup model when the server starts
-setup_model()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=True)
